@@ -19,6 +19,12 @@ from colorama import Fore, Style
 import math
 import os
 
+# %% [markdown]
+# #### Mesure de performances
+
+# %%
+from IPython import get_ipython
+# %load_ext memory_profiler
 
 # %% [markdown]
 # ---
@@ -216,6 +222,8 @@ def matrix_memcpy_numpy(dest, src):
 # ## 4. Réseau de Neurones
 
 # %%
+# REMPLACER NUMPY (_numpy) PAR NAIVE (_numpy) UNIQUEMENT DANS CE BLOC
+
 class Layer:
     def __init__(self, layer_number, number_of_neurons, nneurons_previous_layer, minibatch_size):
         self.number_of_neurons = number_of_neurons
@@ -328,12 +336,12 @@ def accuracy_naive(nn, test_img, test_label, minibatch_size):
     Calcule l'accuracy en pourcentage sur l'ensemble des données test en mode naïf.
     On itère par mini-batch et utilise des boucles explicites pour déterminer les prédictions.
     """
-    ntest = test_img.shape[0]
+    test_size = test_img.shape[0]
     good = 0
-    idxs = zero_to_n(ntest)
+    idxs = zero_to_n(test_size)
     x = alloc_matrix(784, minibatch_size)
     y = alloc_matrix(10, minibatch_size)
-    nbatches = (ntest // minibatch_size) * minibatch_size
+    nbatches = (test_size // minibatch_size) * minibatch_size
     for i in range(0, nbatches, minibatch_size):
         batch_indices = idxs[i:i+minibatch_size]
         populate_naive(x, y, batch_indices, test_img, test_label)
@@ -374,7 +382,7 @@ def cross_entropy_naive(y_pred, y_true, eps=1e-12):
 # %%
 def populate_numpy(x, y, minibatch_idx, train_img, train_label):
     """
-    Remplit les matrices x et y avec le mini-batch en utilisant des opérations vectorisées.
+    Remplit les matrices x et y avec le mini-batch.
     x -> shape (784, minibatch_size)
     y -> shape (10, minibatch_size)
     """
@@ -389,8 +397,8 @@ def accuracy_numpy(nn, test_img, test_label, minibatch_size):
     Compute the accuracy (%) on the test set using fully vectorized NumPy operations.
     Processes the test set in mini-batches.
     """
-    ntest = test_img.shape[0]
-    nbatches = (ntest // minibatch_size) * minibatch_size
+    test_size = test_img.shape[0]
+    nbatches = (test_size // minibatch_size) * minibatch_size
     correct = 0
     for i in range(0, nbatches, minibatch_size):
         batch_indices = np.arange(i, i + minibatch_size)
@@ -413,46 +421,122 @@ def cross_entropy_numpy(y_pred, y_true, eps=1e-12):
 # ---
 # ## 6. Exécution Principale
 
+# %% [markdown]
+# #### Lecture des données
+
 # %%
 DATA_PATH = "DATA"
 
-# 6.1) Lecture des données MNIST
 train_img = read_images(os.path.join(DATA_PATH, "train-images.idx3-ubyte"))
 train_label = read_labels(os.path.join(DATA_PATH, "train-labels.idx1-ubyte"))
 test_img = read_images(os.path.join(DATA_PATH, "t10k-images.idx3-ubyte"))
 test_label = read_labels(os.path.join(DATA_PATH, "t10k-labels.idx1-ubyte"))
 
-datasize = train_img.shape[0]
-ntest = test_img.shape[0]
+train_size = train_img.shape[0]
+test_size = test_img.shape[0]
+print(f"Nombre de données d'entraînement : {train_size}")
+print(f"Nombre de données de test : {test_size}")
 
+# %% [markdown]
+# #### Initialisation du réseau
+
+# %%
 alpha = 0.05
 minibatch_size = 16
 number_of_layers = 3
 nneurons_per_layer = [784, 30, 10]  # 28*28 = 784
 nn = ANN(alpha, minibatch_size, number_of_layers, nneurons_per_layer)
 
-shuffled_idx = zero_to_n(datasize)
+shuffled_idx = zero_to_n(train_size)
 x = alloc_matrix(784, minibatch_size)
 y = alloc_matrix(10, minibatch_size)
 
-# Using the numpy version for fast execution:
-acc_start = accuracy_numpy(nn, test_img, test_label, minibatch_size)
-print("Starting accuracy:", acc_start)
+# %% [markdown]
+# ### 6.1. Mesures individuelles de temps
 
-NEPOCHS = 20
+# %%
+# Matrices d'exemple pour le benchmark
+A_200 = np.random.rand(200, 200)
+B_200 = np.random.rand(200, 200)
+A_200_naive = alloc_matrix(200, 200)
+B_200_naive = alloc_matrix(200, 200)
+matrix_memcpy_numpy(A_200_naive, A_200)
+matrix_memcpy_numpy(B_200_naive, B_200)
+
+print("Mesure du temps - matrix_dot_naive:")
+get_ipython().run_line_magic('timeit', 'matrix_dot_naive(A_200_naive, B_200_naive)')
+
+print("\nMesure du temps - matrix_dot_numpy:")
+get_ipython().run_line_magic('timeit', 'matrix_dot_numpy(A_200, B_200)')
+
+
+# %% [markdown]
+# ### 6.1. Mesures individuelles de la mémoire
+
+# %%
+print("Mesure mémoire - matrix_dot_naive (200, 200):")
+get_ipython().run_line_magic('memit', 'matrix_dot_naive(A_200_naive, B_200_naive)')
+
+print("\nMesure mémoire - matrix_dot_numpy (200, 200):")
+get_ipython().run_line_magic('memit', 'matrix_dot_numpy(A_200, B_200)')
+
+
+# %% [markdown]
+# ### 6.3. Mesures de performances
+
+# %%
+def mini_training_benchmark(nn, train_img, train_label, n_epochs=2):
+    """ Entraîne rapidement le réseau 'nn' pendant n_epochs sur un petit sous-ensemble 
+        (e.g. 2000 échantillons) et renvoie la cross-entropy finale.
+    """
+    subset_size = 2000
+    subset_idx = np.arange(subset_size, dtype=np.uint32)
+    
+    x_tmp = alloc_matrix(784, nn.minibatch_size)
+    y_tmp = alloc_matrix(10, nn.minibatch_size)
+
+    for epoch in range(n_epochs):
+        np.random.shuffle(subset_idx)
+        nbatches = (subset_size // nn.minibatch_size) * nn.minibatch_size
+        ce_sum = 0.0
+        count_batches = 0
+        for i in range(0, nbatches, nn.minibatch_size):
+            batch_indices = subset_idx[i : i + nn.minibatch_size]
+            populate_numpy(x_tmp, y_tmp, batch_indices, train_img, train_label)
+            set_input(nn, x_tmp)
+            forward(nn, sigmoid)
+            y_pred = nn.layers[-1].activations
+            ce_sum += cross_entropy_numpy(y_pred, y_tmp)
+            backward(nn, y_tmp, dsigmoid)
+            count_batches += 1
+    return ce_sum / count_batches if count_batches else 0.0
+
+nn_bench = ANN(alpha, minibatch_size, number_of_layers, nneurons_per_layer)
+
+print("Mesure du temps - Entraînement (2 époques) sur 2000 échantillons:")
+get_ipython().run_line_magic('timeit', 'mini_training_benchmark(nn_bench, train_img, train_label, 2)')
+
+print("\nMesure mémoire - Entraînement (2 époques) sur 2000 échantillons:")
+get_ipython().run_line_magic('memit', 'mini_training_benchmark(nn_bench, train_img, train_label, 2)')
+
+# %% [markdown]
+# ### 6.4. Entraînement du réseau
+
+# %%
+# REMPLACER NUMPY (_numpy) PAR NAIVE (_numpy) UNIQUEMENT DANS CE BLOC
+
+NEPOCHS = 5
+
 for epoch in range(NEPOCHS):
-    print(f"\nEPOCH: {epoch}")
-    shuffle(shuffled_idx, datasize)
-    nbatches = (datasize // minibatch_size) * minibatch_size
+    shuffle(shuffled_idx, train_size)
+    nbatches = (train_size // minibatch_size) * minibatch_size
     batch_iter = range(0, nbatches, minibatch_size)
     ce_total = 0.0
     n_train_batches = 0
     acc = accuracy_numpy(nn, test_img, test_label, minibatch_size)
     desc = f'Epoch {epoch} - Acc: {acc:.2f}%'
-    print(Fore.GREEN + desc + Style.RESET_ALL)
     for i in tqdm(batch_iter, desc=desc):
         batch_indices = shuffled_idx[i : i + minibatch_size]
-        # To test the numpy version, call populate_numpy.
         populate_numpy(x, y, batch_indices, train_img, train_label)
         set_input(nn, x)
         forward(nn, sigmoid)
@@ -464,4 +548,7 @@ for epoch in range(NEPOCHS):
     ce_mean = ce_total / n_train_batches
     acc = accuracy_numpy(nn, test_img, test_label, minibatch_size)
     desc = f'Epoch {epoch} - Acc: {acc:.2f}%, CE: {ce_mean:.4f}'
-    print(Fore.GREEN + desc + Style.RESET_ALL)
+
+acc_end = accuracy_numpy(nn, test_img, test_label, minibatch_size)
+ce_end = cross_entropy_numpy(y_pred, y)
+print("Final Model : Accuracy = {:.2f}%, Cross-Entropy Error = {:.4f}".format(acc_end, ce_end))
