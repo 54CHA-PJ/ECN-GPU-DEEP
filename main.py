@@ -18,13 +18,21 @@ from tqdm import tqdm
 from colorama import Fore, Style
 import math
 import os
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+import numba as nb
+from numba import cuda
 
 # %% [markdown]
 # #### Mesure de performances
 
 # %%
 from IPython import get_ipython
+# %load_ext autoreload
+# %autoreload 2
 # %load_ext memory_profiler
+# %load_ext line_profiler
 
 # %% [markdown]
 # ---
@@ -218,31 +226,203 @@ def matrix_memcpy_numpy(dest, src):
 
 
 # %% [markdown]
+# ### 3.3. Version Parallèle
+
+# %% [markdown]
+# ```python
+# # Usage classique style C
+# tx = cuda.threadIdx.x   # Thread id (dim 1)
+# ty = cuda.threadIdx.y   # Thread id (dim 2)
+# bx = cuda.blockIdx.x    # Block id (dim 1)
+# by = cuda.blockIdx.y    # Block id (dim 2)
+# bw = cuda.blockDim.x    # Block width
+# bh = cuda.blockDim.y    # Block height
+# row = by * bh + ty
+# col = bx * bw + tx
+# # Usage Python
+# row, col = cuda.grid(2)
+# ```
+
+# %%
+@cuda.jit
+def matrix_dot_cuda(m1, m2, res, nrow1, ncol1, ncol2):
+    row, col = cuda.grid(2)
+    if row < nrow1 and col < ncol2:
+        tmp = 0.0
+        for k in range(ncol1):
+            tmp += m1[row, k] * m2[k, col]
+        res[row, col] = tmp
+
+@cuda.jit
+def matrix_sum_cuda(m1, m2, res, nrow, ncol):
+    row, col = cuda.grid(2)
+    if row < nrow and col < ncol:
+        res[row, col] = m1[row, col] + m2[row, col]
+
+@cuda.jit
+def matrix_minus_cuda(m1, m2, res, nrow, ncol):
+    row, col = cuda.grid(2)
+    if row < nrow and col < ncol:
+        res[row, col] = m1[row, col] - m2[row, col]
+
+@cuda.jit
+def hadamard_product_cuda(m1, m2, res, nrow, ncol):
+    row, col = cuda.grid(2)
+    if row < nrow and col < ncol:
+        res[row, col] = m1[row, col] * m2[row, col]
+
+@cuda.jit
+def matrix_transpose_cuda(m, res, nrow, ncol):
+    row, col = cuda.grid(2)
+    if row < nrow and col < ncol:
+        res[col, row] = m[row, col]
+
+@cuda.jit
+def matrix_scalar_cuda(m, res, scalar, nrow, ncol):
+    row, col = cuda.grid(2)
+    if row < nrow and col < ncol:
+        res[row, col] = m[row, col] * scalar
+
+@cuda.jit
+def matrix_memcpy_cuda(dest, src, nrow, ncol):
+    row, col = cuda.grid(2)
+    if row < nrow and col < ncol:
+        dest[row, col] = src[row, col]
+        
+@cuda.jit
+def matrix_function_id_cuda(m_in, m_out, nrow, ncol, func_id):
+    """
+    Applique la fonction correspondant à func_id :
+      0 -> exp
+      1 -> sigmoid
+      2 -> dsigmoid
+      ...
+    """
+    row, col = cuda.grid(2)
+    if row < nrow and col < ncol:
+        val = m_in[row, col]
+
+        if func_id == 0:
+            # exp
+            result = math.exp(val)
+        elif func_id == 1:
+            # sigmoid : 1 / (1 + exp(-x))
+            result = 1.0 / (1.0 + math.exp(-val))
+        elif func_id == 2:
+            # dsigmoid : s*(1-s) avec s = sigmoid(x)
+            s = 1.0 / (1.0 + math.exp(-val))
+            result = s * (1.0 - s)
+        else:
+            # par défaut, identity
+            result = val
+
+        m_out[row, col] = result
+
+
+# %%
+def matrix_dot_parallel(m1, m2):
+    nrow1, ncol1 = m1.shape
+    nrow2, ncol2 = m2.shape
+    if ncol1 != nrow2:
+        raise ValueError("Incompatible matrix dimensions")
+    res = alloc_matrix(nrow1, ncol2)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(ncol2 / 16), math.ceil(nrow1 / 16))
+    matrix_dot_cuda[blocks_per_grid, threads_per_block](m1, m2, res, nrow1, ncol1, ncol2)
+    return res
+
+def matrix_sum_parallel(m1, m2):
+    nrow, ncol = m1.shape
+    res = alloc_matrix(nrow, ncol)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(nrow / 16), math.ceil(ncol / 16))
+    matrix_sum_cuda[blocks_per_grid, threads_per_block](m1, m2, res, nrow, ncol)
+    return res
+
+def matrix_minus_parallel(m1, m2):
+    nrow, ncol = m1.shape
+    res = alloc_matrix(nrow, ncol)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(nrow / 16), math.ceil(ncol / 16))
+    matrix_minus_cuda[blocks_per_grid, threads_per_block](m1, m2, res, nrow, ncol)
+    return res
+
+def hadamard_product_parallel(m1, m2):
+    nrow, ncol = m1.shape
+    res = alloc_matrix(nrow, ncol)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(nrow / 16), math.ceil(ncol / 16))
+    hadamard_product_cuda[blocks_per_grid, threads_per_block](m1, m2, res, nrow, ncol)
+    return res
+
+def matrix_transpose_parallel(m):
+    nrow, ncol = m.shape
+    res = alloc_matrix(ncol, nrow)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(nrow / 16), math.ceil(ncol / 16))
+    matrix_transpose_cuda[blocks_per_grid, threads_per_block](m, res, nrow, ncol)
+    return res
+
+def matrix_scalar_parallel(m, s):
+    nrow, ncol = m.shape
+    res = alloc_matrix(nrow, ncol)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(nrow / 16), math.ceil(ncol / 16))
+    matrix_scalar_cuda[blocks_per_grid, threads_per_block](m, res, s, nrow, ncol)
+    return res
+
+def matrix_memcpy_parallel(dest, src):
+    nrow, ncol = src.shape
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(nrow / 16), math.ceil(ncol / 16))
+    matrix_memcpy_cuda[blocks_per_grid, threads_per_block](dest, src, nrow, ncol)
+    
+def matrix_function_parallel(m1, func_name):
+    """
+    Applique la fonction func_name (par ex. 'exp', 'sigmoid', 'dsigmoid') 
+    à chaque élément de m1 en mode GPU (kernel unique à ID).
+    """
+    # On mappe les noms -> IDs
+    if func_name == "exp":
+        func_id = 0
+    elif func_name == "sigmoid":
+        func_id = 1
+    elif func_name == "dsigmoid":
+        func_id = 2
+    else:
+        raise ValueError(f"Unknown function ID : {func_name}")
+
+    nrow, ncol = m1.shape
+    res = alloc_matrix(nrow, ncol)
+    threads_per_block = (16, 16)
+    blocks_per_grid = (math.ceil(nrow / 16), math.ceil(ncol / 16))
+    matrix_function_id_cuda[blocks_per_grid, threads_per_block](m1, res, nrow, ncol, func_id)
+    return res
+
+
+
+# %% [markdown]
 # ---
 # ## 4. Réseau de Neurones
 
 # %%
-# REMPLACER NUMPY (_numpy) PAR NAIVE (_numpy) UNIQUEMENT DANS CE BLOC
+# NOTE ICI REMPLACER LES EXTENSIONS
+# _naive // _parallel // _numpy
 
 class Layer:
     def __init__(self, layer_number, number_of_neurons, nneurons_previous_layer, minibatch_size):
         self.number_of_neurons = number_of_neurons
         self.minibatch_size = minibatch_size
-        # activations et z de shape (nneurons, batch_size)
         self.activations = alloc_matrix(number_of_neurons, minibatch_size)
         self.z           = alloc_matrix(number_of_neurons, minibatch_size)
         self.delta       = alloc_matrix(number_of_neurons, minibatch_size)
-        
-        # weights de shape (nneurons, nneurons_previous_layer)
         self.weights     = alloc_matrix(number_of_neurons, nneurons_previous_layer)
-        # biases de shape (nneurons, 1)
         self.biases      = alloc_matrix(number_of_neurons, 1)
         
         if layer_number > 0:
             self.init_weight(nneurons_previous_layer)
     
     def init_weight(self, nneurons_prev):
-        # Initialisation vectorisée
         sigma = init_sigma(nneurons_prev)
         r, c = self.weights.shape
         self.weights = np.random.normal(0.0, sigma, size=(r, c))
@@ -268,7 +448,6 @@ class ANN:
                 )
 
 def set_input(nn, input_matrix):
-    # Utilise la version numpy pour la rapidité
     matrix_memcpy_numpy(nn.layers[0].activations, input_matrix)
 
 def forward(nn, activation_function):
@@ -421,9 +600,6 @@ def cross_entropy_numpy(y_pred, y_true, eps=1e-12):
 # ---
 # ## 6. Exécution Principale
 
-# %% [markdown]
-# #### Lecture des données
-
 # %%
 DATA_PATH = "DATA"
 
@@ -438,7 +614,170 @@ print(f"Nombre de données d'entraînement : {train_size}")
 print(f"Nombre de données de test : {test_size}")
 
 # %% [markdown]
-# #### Initialisation du réseau
+# ### 6.1. Mesures individuelles de temps
+
+# %%
+A_200 = np.random.rand(200, 200)
+B_200 = np.random.rand(200, 200)
+A_200_naive = alloc_matrix(200, 200)
+B_200_naive = alloc_matrix(200, 200)
+matrix_memcpy_numpy(A_200_naive, A_200)
+matrix_memcpy_numpy(B_200_naive, B_200)
+
+all_functions_200 = {
+    "matrix_dot_naive":             lambda: matrix_dot_naive(A_200_naive, B_200_naive),
+    "matrix_dot_numpy":             lambda: matrix_dot_numpy(A_200, B_200),
+    "matrix_dot_parallel":          lambda: matrix_dot_parallel(A_200, B_200),
+    "matrix_sum_naive":             lambda: matrix_sum_naive(A_200_naive, B_200_naive),
+    "matrix_sum_numpy":             lambda: matrix_sum_numpy(A_200, B_200),
+    "matrix_sum_parallel":          lambda: matrix_sum_parallel(A_200, B_200),
+    "matrix_minus_naive":           lambda: matrix_minus_naive(A_200_naive, B_200_naive),
+    "matrix_minus_numpy":           lambda: matrix_minus_numpy(A_200, B_200),
+    "matrix_minus_parallel":        lambda: matrix_minus_parallel(A_200, B_200),
+    "hadamard_product_naive":       lambda: hadamard_product_naive(A_200_naive, B_200_naive),
+    "hadamard_product_numpy":       lambda: hadamard_product_numpy(A_200, B_200),
+    "hadamard_product_parallel":    lambda: hadamard_product_parallel(A_200, B_200),
+    "matrix_function_naive":        lambda: matrix_function_naive(A_200_naive, np.exp),
+    "matrix_function_numpy":        lambda: matrix_function_numpy(A_200, np.exp),
+    "matrix_function_parallel":     lambda: matrix_function_parallel(A_200, "exp"),
+    "matrix_transpose_naive":       lambda: matrix_transpose_naive(A_200_naive),
+    "matrix_transpose_numpy":       lambda: matrix_transpose_numpy(A_200),
+    "matrix_transpose_parallel":    lambda: matrix_transpose_parallel(A_200),
+    "matrix_scalar_naive":          lambda: matrix_scalar_naive(A_200_naive, 1.5),
+    "matrix_scalar_numpy":          lambda: matrix_scalar_numpy(A_200, 1.5),
+    "matrix_scalar_parallel":       lambda: matrix_scalar_parallel(A_200, 1.5),
+    "matrix_memcpy_naive":          lambda: matrix_memcpy_naive(A_200_naive, B_200_naive),
+    "matrix_memcpy_numpy":          lambda: matrix_memcpy_numpy(A_200_naive, B_200),
+    "matrix_memcpy_parallel":       lambda: matrix_memcpy_parallel(A_200_naive, B_200),
+}
+
+# %%
+results_time = {}
+for func_name, func_call in all_functions_200.items():
+    print(f"\n=== {func_name} ===")
+    time_result = get_ipython().run_line_magic('timeit', '-o func_call()')
+    results_time[func_name] = time_result
+
+
+# %%
+def plot_results_timeit(results, title):
+    
+    pairs = []
+    for key, val in results.items():
+        if 'naive' in key:
+            numpy_key = key.replace('naive', 'numpy')
+            if numpy_key in results:
+                pairs.append((key.replace('_naive', ''), val.best, results[numpy_key].best))
+                
+    n_plots = len(pairs)
+    fig, axes = plt.subplots(n_plots, 1, figsize=(10, n_plots * 0.9), sharex=True)
+    if n_plots == 1:
+        axes = [axes]
+    global_min = min(min(naive, numpy) for _, naive, numpy in pairs)
+    global_max = max(max(naive, numpy) for _, naive, numpy in pairs)
+    
+    for ax, (operation, naive_val, numpy_val) in zip(axes, pairs):
+        y_positions = [1.95, 2.05]
+        bar_height = 0.07
+        ax.barh(y_positions, [naive_val, numpy_val], color=['skyblue', 'lightgreen'], height=bar_height)
+        ax.set_title(operation, fontsize=10)
+        ax.set_xscale('log')
+        lower_limit = max(global_min * 0.8, 1e-12)
+        ax.set_xlim(lower_limit, global_max * 1.2)
+        ax.xaxis.set_major_locator(mticker.LogLocator(base=10.0))
+        ax.xaxis.set_major_formatter(mticker.LogFormatter(base=10.0, labelOnlyBase=False))
+        ax.set_ylim(1.9, 2.1)
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(['Naive', 'Numpy'])
+
+        for pos, val in zip(y_positions, [naive_val, numpy_val]):
+            ax.text(val, pos, f'{val:.2e}', va='center', ha='left', color='black', fontsize=8)
+
+    plt.suptitle(title, fontsize=12)
+    plt.tight_layout(pad=0.5, h_pad=0.5, w_pad=0.5)
+    plt.show()
+
+plot_results_timeit(results_time, "Mesure de temps : Opérations matricielles (secondes)")
+
+# %% [markdown]
+# ### 6.1. Mesures individuelles de la mémoire
+
+# %%
+A_800 = np.random.rand(800, 800)
+B_800 = np.random.rand(800, 800)
+A_800_naive = alloc_matrix(800, 800)
+B_800_naive = alloc_matrix(800, 800)
+matrix_memcpy_numpy(A_800_naive, A_800)
+matrix_memcpy_numpy(B_800_naive, B_800)
+
+all_functions_800 = {
+    "matrix_dot_naive":       lambda: matrix_dot_naive(A_800_naive, B_800_naive),
+    "matrix_dot_numpy":       lambda: matrix_dot_numpy(A_800, B_800),
+    "matrix_sum_naive":       lambda: matrix_sum_naive(A_800_naive, B_800_naive),
+    "matrix_sum_numpy":       lambda: matrix_sum_numpy(A_800, B_800),
+    "matrix_minus_naive":     lambda: matrix_minus_naive(A_800_naive, B_800_naive),
+    "matrix_minus_numpy":     lambda: matrix_minus_numpy(A_800, B_800),
+    "hadamard_product_naive": lambda: hadamard_product_naive(A_800_naive, B_800_naive),
+    "hadamard_product_numpy": lambda: hadamard_product_numpy(A_800, B_800),
+    "matrix_function_naive":  lambda: matrix_function_naive(A_800_naive, np.exp),
+    "matrix_function_numpy":  lambda: matrix_function_numpy(A_800, np.exp),
+    "matrix_transpose_naive": lambda: matrix_transpose_naive(A_800_naive),
+    "matrix_transpose_numpy": lambda: matrix_transpose_numpy(A_800),
+    "matrix_scalar_naive":    lambda: matrix_scalar_naive(A_800_naive, 1.5),
+    "matrix_scalar_numpy":    lambda: matrix_scalar_numpy(A_800, 1.5),
+    "matrix_memcpy_naive":    lambda: matrix_memcpy_naive(A_800_naive, B_800_naive),
+    "matrix_memcpy_numpy":    lambda: matrix_memcpy_numpy(A_800_naive, B_800),
+}
+
+# %%
+results_memory = {}
+for func_name, func_call in all_functions_800.items():
+    print(f"\n=== {func_name} ===")
+    memory_result = get_ipython().run_line_magic('memit', '-o func_call()')
+    results_memory[func_name] = memory_result
+
+
+# %%
+def plot_results_memit(results, title):
+    
+    pairs = []
+    for key, val in results.items():
+        if 'naive' in key:
+            numpy_key = key.replace('naive', 'numpy')
+            if numpy_key in results:
+                pairs.append((key.replace('_naive', ''), val.mem_usage[0], results[numpy_key].mem_usage[0]))
+                
+    n_plots = len(pairs)
+    fig, axes = plt.subplots(n_plots, 1, figsize=(10, n_plots * 0.9), sharex=True)
+    if n_plots == 1:
+        axes = [axes]
+    
+    global_min = min(min(naive, numpy) for _, naive, numpy in pairs)
+    global_max = max(max(naive, numpy) for _, naive, numpy in pairs)
+    
+    for ax, (operation, naive_val, numpy_val) in zip(axes, pairs):
+        naive_val -= global_min
+        numpy_val -= global_min
+        y_positions = [1.95, 2.05]
+        bar_height = 0.07
+        ax.barh(y_positions, [naive_val, numpy_val], color=['skyblue', 'lightgreen'], height=bar_height)
+        ax.set_title(operation, fontsize=10)
+        ax.set_xlim(0, (global_max - global_min) * 1.2)
+        ax.set_ylim(1.9, 2.1)
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(['Naive', 'Numpy'])
+
+        for pos, val in zip(y_positions, [naive_val, numpy_val]):
+            ax.text(val, pos, f'{val:.2f}', va='center', ha='left', color='black', fontsize=8)
+
+    plt.suptitle(title, fontsize=12)
+    plt.tight_layout(pad=0.5, h_pad=0.5, w_pad=0.5)
+    plt.show()
+
+plot_results_memit(results_memory, "Mesure de la mémoire : Opérations matricielles (Méga-octets)")
+
+# %% [markdown]
+# ### 6.3. Mesures de performances à l'entrainement
 
 # %%
 alpha = 0.05
@@ -451,79 +790,65 @@ shuffled_idx = zero_to_n(train_size)
 x = alloc_matrix(784, minibatch_size)
 y = alloc_matrix(10, minibatch_size)
 
-# %% [markdown]
-# ### 6.1. Mesures individuelles de temps
+def test_epoch_numpy(nn, train_img, train_label, batch_size=16, max_samples=1000):
+    shuffle(shuffled_idx, train_size)
+    nbatches = min((train_size // batch_size) * batch_size, max_samples)
+    batch_iter = range(0, nbatches, batch_size)
+    ce_total = 0.0
+    n_train_batches = 0
+    acc = accuracy_numpy(nn, test_img, test_label, batch_size)
+    desc = f'Acc: {acc:.2f}%'
+    for i in tqdm(batch_iter, desc=desc):
+        batch_indices = shuffled_idx[i : i + batch_size]
+        populate_numpy(x, y, batch_indices, train_img, train_label)
+        set_input(nn, x)
+        forward(nn, sigmoid)
+        y_pred = nn.layers[-1].activations  
+        ce_batch = cross_entropy_numpy(y_pred, y)
+        ce_total += ce_batch
+        n_train_batches += 1
+        backward(nn, y, dsigmoid)
+    ce_mean = ce_total / n_train_batches
+    acc = accuracy_numpy(nn, test_img, test_label, batch_size)
+    desc = f'Acc: {acc:.2f}%, CE: {ce_mean:.4f}'
+    return nbatches
+
+def test_epoch_naive(nn, train_img, train_label, batch_size=16, max_samples=1000):
+    shuffle(shuffled_idx, train_size)
+    nbatches = min((train_size // batch_size) * batch_size, max_samples)
+    batch_iter = range(0, nbatches, batch_size)
+    ce_total = 0.0
+    n_train_batches = 0
+    acc = accuracy_naive(nn, test_img, test_label, batch_size)
+    desc = f'Acc: {acc:.2f}%'
+    for i in tqdm(batch_iter, desc=desc):
+        batch_indices = shuffled_idx[i : i + batch_size]
+        populate_naive(x, y, batch_indices, train_img, train_label)
+        set_input(nn, x)
+        forward(nn, sigmoid)
+        y_pred = nn.layers[-1].activations  
+        ce_batch = cross_entropy_naive(y_pred, y)
+        ce_total += ce_batch
+        n_train_batches += 1
+        backward(nn, y, dsigmoid)
+    ce_mean = ce_total / n_train_batches
+    acc = accuracy_naive(nn, test_img, test_label, batch_size)
+    desc = f'Acc: {acc:.2f}%, CE: {ce_mean:.4f}'
+    return nbatches
+
 
 # %%
-# Matrices d'exemple pour le benchmark
-A_200 = np.random.rand(200, 200)
-B_200 = np.random.rand(200, 200)
-A_200_naive = alloc_matrix(200, 200)
-B_200_naive = alloc_matrix(200, 200)
-matrix_memcpy_numpy(A_200_naive, A_200)
-matrix_memcpy_numpy(B_200_naive, B_200)
-
-print("Mesure du temps - matrix_dot_naive:")
-get_ipython().run_line_magic('timeit', 'matrix_dot_naive(A_200_naive, B_200_naive)')
-
-print("\nMesure du temps - matrix_dot_numpy:")
-get_ipython().run_line_magic('timeit', 'matrix_dot_numpy(A_200, B_200)')
-
-
-# %% [markdown]
-# ### 6.1. Mesures individuelles de la mémoire
+get_ipython().run_line_magic('lprun', '-f test_epoch_naive test_epoch_naive(nn, train_img, train_label, 16, 5000)')
 
 # %%
-print("Mesure mémoire - matrix_dot_naive (200, 200):")
-get_ipython().run_line_magic('memit', 'matrix_dot_naive(A_200_naive, B_200_naive)')
-
-print("\nMesure mémoire - matrix_dot_numpy (200, 200):")
-get_ipython().run_line_magic('memit', 'matrix_dot_numpy(A_200, B_200)')
-
-
-# %% [markdown]
-# ### 6.3. Mesures de performances
-
-# %%
-def mini_training_benchmark(nn, train_img, train_label, n_epochs=2):
-    """ Entraîne rapidement le réseau 'nn' pendant n_epochs sur un petit sous-ensemble 
-        (e.g. 2000 échantillons) et renvoie la cross-entropy finale.
-    """
-    subset_size = 2000
-    subset_idx = np.arange(subset_size, dtype=np.uint32)
-    
-    x_tmp = alloc_matrix(784, nn.minibatch_size)
-    y_tmp = alloc_matrix(10, nn.minibatch_size)
-
-    for epoch in range(n_epochs):
-        np.random.shuffle(subset_idx)
-        nbatches = (subset_size // nn.minibatch_size) * nn.minibatch_size
-        ce_sum = 0.0
-        count_batches = 0
-        for i in range(0, nbatches, nn.minibatch_size):
-            batch_indices = subset_idx[i : i + nn.minibatch_size]
-            populate_numpy(x_tmp, y_tmp, batch_indices, train_img, train_label)
-            set_input(nn, x_tmp)
-            forward(nn, sigmoid)
-            y_pred = nn.layers[-1].activations
-            ce_sum += cross_entropy_numpy(y_pred, y_tmp)
-            backward(nn, y_tmp, dsigmoid)
-            count_batches += 1
-    return ce_sum / count_batches if count_batches else 0.0
-
-nn_bench = ANN(alpha, minibatch_size, number_of_layers, nneurons_per_layer)
-
-print("Mesure du temps - Entraînement (2 époques) sur 2000 échantillons:")
-get_ipython().run_line_magic('timeit', 'mini_training_benchmark(nn_bench, train_img, train_label, 2)')
-
-print("\nMesure mémoire - Entraînement (2 époques) sur 2000 échantillons:")
-get_ipython().run_line_magic('memit', 'mini_training_benchmark(nn_bench, train_img, train_label, 2)')
+get_ipython().run_line_magic('lprun', '-f test_epoch_numpy test_epoch_numpy(nn, train_img, train_label, 16, 50000)')
 
 # %% [markdown]
 # ### 6.4. Entraînement du réseau
 
 # %%
-# REMPLACER NUMPY (_numpy) PAR NAIVE (_numpy) UNIQUEMENT DANS CE BLOC
+# NOTE ICI REMPLACER LES EXTENSIONS
+# _naive // _parallel // _numpy
 
 NEPOCHS = 5
 
